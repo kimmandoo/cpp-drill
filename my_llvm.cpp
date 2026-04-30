@@ -1,4 +1,3 @@
-#include "include/KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -8,34 +7,31 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
-#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
-#include "llvm/Passes/PassBuilder.h"
-#include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/MC/TargetRegistry.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/TargetSelect.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
-#include "llvm/Transforms/InstCombine/InstCombine.h"
-#include "llvm/Transforms/Scalar.h"
-#include "llvm/Transforms/Scalar/GVN.h"
-#include "llvm/Transforms/Scalar/Reassociate.h"
-#include "llvm/Transforms/Scalar/SimplifyCFG.h"
-#include "llvm/Transforms/Utils/Mem2Reg.h"
+#include "llvm/Target/TargetOptions.h"
+#include "llvm/TargetParser/Host.h"
 #include <algorithm>
 #include <cassert>
 #include <cctype>
-#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
 using namespace llvm;
-using namespace llvm::orc;
+using namespace llvm::sys;
 
 //===----------------------------------------------------------------------===//
 // Lexer
@@ -709,14 +705,6 @@ static std::unique_ptr<LLVMContext> TheContext;
 static std::unique_ptr<Module> TheModule;
 static std::unique_ptr<IRBuilder<>> Builder;
 static std::map<std::string, AllocaInst *> NamedValues;
-static std::unique_ptr<KaleidoscopeJIT> TheJIT;
-static std::unique_ptr<FunctionPassManager> TheFPM;
-static std::unique_ptr<LoopAnalysisManager> TheLAM;
-static std::unique_ptr<FunctionAnalysisManager> TheFAM;
-static std::unique_ptr<CGSCCAnalysisManager> TheCGAM;
-static std::unique_ptr<ModuleAnalysisManager> TheMAM;
-static std::unique_ptr<PassInstrumentationCallbacks> ThePIC;
-static std::unique_ptr<StandardInstrumentations> TheSI;
 static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 static ExitOnError ExitOnErr;
 
@@ -755,12 +743,12 @@ Value *NumberExprAST::codegen() {
 
 Value *VariableExprAST::codegen() {
   // Look this variable up in the function.
-  AllocaInst *A = NamedValues[Name];
-  if (!A)
+  Value *V = NamedValues[Name];
+  if (!V)
     return LogErrorV("Unknown variable name");
 
   // Load the value.
-  return Builder->CreateLoad(A->getAllocatedType(), A, Name.c_str());
+  return Builder->CreateLoad(Type::getDoubleTy(*TheContext), V, Name.c_str());
 }
 
 Value *UnaryExprAST::codegen() {
@@ -972,8 +960,8 @@ Value *ForExprAST::codegen() {
 
   // Reload, increment, and restore the alloca.  This handles the case where
   // the body of the loop mutates the variable.
-  Value *CurVar =
-      Builder->CreateLoad(Alloca->getAllocatedType(), Alloca, VarName.c_str());
+  Value *CurVar = Builder->CreateLoad(Type::getDoubleTy(*TheContext), Alloca,
+                                      VarName.c_str());
   Value *NextVar = Builder->CreateFAdd(CurVar, StepVal, "nextvar");
   Builder->CreateStore(NextVar, Alloca);
 
@@ -1103,9 +1091,6 @@ Function *FunctionAST::codegen() {
     // Validate the generated code, checking for consistency.
     verifyFunction(*TheFunction);
 
-    // Run the optimizer on the function.
-    TheFPM->run(*TheFunction, *TheFAM);
-
     return TheFunction;
   }
 
@@ -1121,43 +1106,13 @@ Function *FunctionAST::codegen() {
 // Top-Level parsing and JIT Driver
 //===----------------------------------------------------------------------===//
 
-static void InitializeModuleAndManagers() {
-  // Open a new context and module.
+static void InitializeModuleAndPassManager() {
+  // Open a new module.
   TheContext = std::make_unique<LLVMContext>();
-  TheModule = std::make_unique<Module>("KaleidoscopeJIT", *TheContext);
-  TheModule->setDataLayout(TheJIT->getDataLayout());
+  TheModule = std::make_unique<Module>("my cool jit", *TheContext);
 
   // Create a new builder for the module.
   Builder = std::make_unique<IRBuilder<>>(*TheContext);
-
-  // Create new pass and analysis managers.
-  TheFPM = std::make_unique<FunctionPassManager>();
-  TheLAM = std::make_unique<LoopAnalysisManager>();
-  TheFAM = std::make_unique<FunctionAnalysisManager>();
-  TheCGAM = std::make_unique<CGSCCAnalysisManager>();
-  TheMAM = std::make_unique<ModuleAnalysisManager>();
-  ThePIC = std::make_unique<PassInstrumentationCallbacks>();
-  TheSI = std::make_unique<StandardInstrumentations>(*TheContext,
-                                                     /*DebugLogging*/ true);
-  TheSI->registerCallbacks(*ThePIC, TheMAM.get());
-
-  // Add transform passes.
-  // Promote allocas to registers.
-  TheFPM->addPass(PromotePass());
-  // Do simple "peephole" optimizations and bit-twiddling optzns.
-  TheFPM->addPass(InstCombinePass());
-  // Reassociate expressions.
-  TheFPM->addPass(ReassociatePass());
-  // Eliminate Common SubExpressions.
-  TheFPM->addPass(GVNPass());
-  // Simplify the control flow graph (deleting unreachable blocks, etc).
-  TheFPM->addPass(SimplifyCFGPass());
-
-  // Register analysis passes used in these transform passes.
-  PassBuilder PB;
-  PB.registerModuleAnalyses(*TheMAM);
-  PB.registerFunctionAnalyses(*TheFAM);
-  PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
 }
 
 static void HandleDefinition() {
@@ -1166,9 +1121,6 @@ static void HandleDefinition() {
       fprintf(stderr, "Read function definition:");
       FnIR->print(errs());
       fprintf(stderr, "\n");
-      ExitOnErr(TheJIT->addModule(
-          ThreadSafeModule(std::move(TheModule), std::move(TheContext))));
-      InitializeModuleAndManagers();
     }
   } else {
     // Skip token for error recovery.
@@ -1193,26 +1145,7 @@ static void HandleExtern() {
 static void HandleTopLevelExpression() {
   // Evaluate a top-level expression into an anonymous function.
   if (auto FnAST = ParseTopLevelExpr()) {
-    if (FnAST->codegen()) {
-      // Create a ResourceTracker to track JIT'd memory allocated to our
-      // anonymous expression -- that way we can free it after executing.
-      auto RT = TheJIT->getMainJITDylib().createResourceTracker();
-
-      auto TSM = ThreadSafeModule(std::move(TheModule), std::move(TheContext));
-      ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
-      InitializeModuleAndManagers();
-
-      // Search the JIT for the __anon_expr symbol.
-      auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
-
-      // Get the symbol's address and cast it to the right type (takes no
-      // arguments, returns a double) so we can call it as a native function.
-      double (*FP)() = ExprSymbol.getAddress().toPtr<double (*)()>();
-      fprintf(stderr, "Evaluated to %f\n", FP());
-
-      // Delete the anonymous expression module from the JIT.
-      ExitOnErr(RT->remove());
-    }
+    FnAST->codegen();
   } else {
     // Skip token for error recovery.
     getNextToken();
@@ -1222,7 +1155,6 @@ static void HandleTopLevelExpression() {
 /// top ::= definition | external | expression | ';'
 static void MainLoop() {
   while (true) {
-    fprintf(stderr, "ready> ");
     switch (CurTok) {
     case tok_eof:
       return;
@@ -1269,13 +1201,8 @@ extern "C" DLLEXPORT double printd(double X) {
 //===----------------------------------------------------------------------===//
 
 int main() {
-  InitializeNativeTarget();
-  InitializeNativeTargetAsmPrinter();
-  InitializeNativeTargetAsmParser();
-
   // Install standard binary operators.
   // 1 is lowest precedence.
-  BinopPrecedence['='] = 2;
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
   BinopPrecedence['-'] = 20;
@@ -1285,12 +1212,63 @@ int main() {
   fprintf(stderr, "ready> ");
   getNextToken();
 
-  TheJIT = ExitOnErr(KaleidoscopeJIT::Create());
-
-  InitializeModuleAndManagers();
+  InitializeModuleAndPassManager();
 
   // Run the main "interpreter loop" now.
   MainLoop();
+
+  // Initialize the target registry etc.
+  InitializeAllTargetInfos();
+  InitializeAllTargets();
+  InitializeAllTargetMCs();
+  InitializeAllAsmParsers();
+  InitializeAllAsmPrinters();
+
+  auto TargetTriple = sys::getDefaultTargetTriple();
+  TheModule->setTargetTriple(TargetTriple);
+
+  std::string Error;
+  auto Target =
+      TargetRegistry::lookupTarget(TheModule->getTargetTriple(), Error);
+
+  // Print an error and exit if we couldn't find the requested target.
+  // This generally occurs if we've forgotten to initialise the
+  // TargetRegistry or we have a bogus target triple.
+  if (!Target) {
+    errs() << Error;
+    return 1;
+  }
+
+  auto CPU = "generic";
+  auto Features = "";
+
+  TargetOptions opt;
+  auto TheTargetMachine = Target->createTargetMachine(
+      TargetTriple, CPU, Features, opt, Reloc::PIC_);
+
+  TheModule->setDataLayout(TheTargetMachine->createDataLayout());
+
+  auto Filename = "output.o";
+  std::error_code EC;
+  raw_fd_ostream dest(Filename, EC, sys::fs::OF_None);
+
+  if (EC) {
+    errs() << "Could not open file: " << EC.message();
+    return 1;
+  }
+
+  legacy::PassManager pass;
+  auto FileType = CodeGenFileType::ObjectFile;
+
+  if (TheTargetMachine->addPassesToEmitFile(pass, dest, nullptr, FileType)) {
+    errs() << "TheTargetMachine can't emit a file of this type";
+    return 1;
+  }
+
+  pass.run(*TheModule);
+  dest.flush();
+
+  outs() << "Wrote " << Filename << "\n";
 
   return 0;
 }

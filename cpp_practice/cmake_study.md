@@ -155,3 +155,116 @@ release 빌드에는 최적화가 적용되어있어서 디버깅이 어려움.
 디버그로 만들어진 실행 파일에 gdb를 켜서 디버깅 가능
 
 
+# llvm 링크하는 거 추가 공부
+
+kaleidoscope 학습 하면서 CMakeLists도 만들어봤는데, 각 줄이 뭘 의미하는 지 보겠다.
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+
+project(toy_llvm LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_program(LLVM_CONFIG llvm-config REQUIRED)
+
+execute_process(
+    COMMAND ${LLVM_CONFIG} --cxxflags
+    OUTPUT_VARIABLE LLVM_CXXFLAGS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+separate_arguments(LLVM_CXXFLAGS NATIVE_COMMAND ${LLVM_CXXFLAGS})
+
+execute_process(
+    COMMAND ${LLVM_CONFIG} --ldflags --system-libs --libs all
+    OUTPUT_VARIABLE LLVM_LDFLAGS
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+separate_arguments(LLVM_LDFLAGS NATIVE_COMMAND ${LLVM_LDFLAGS})
+
+add_executable(toy
+    my_llvm.cpp
+)
+target_compile_options(toy PRIVATE ${LLVM_CXXFLAGS})
+target_link_libraries(toy PRIVATE ${LLVM_LDFLAGS})
+
+set(GENERATED_OBJECT ${CMAKE_BINARY_DIR}/output.o)
+set(KALEIDOSCOPE_INPUT ${CMAKE_CURRENT_SOURCE_DIR}/kaleidoscope_input.txt)
+
+add_custom_command(
+    OUTPUT ${GENERATED_OBJECT}
+    COMMAND /bin/bash -c "$<TARGET_FILE:toy> < ${KALEIDOSCOPE_INPUT}"
+    DEPENDS toy ${KALEIDOSCOPE_INPUT}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Generating output.o from Kaleidoscope source"
+    VERBATIM
+)
+
+add_custom_target(generate_output DEPENDS ${GENERATED_OBJECT})
+
+add_executable(main
+    main.cpp
+    ${GENERATED_OBJECT}
+)
+add_dependencies(main generate_output)
+```
+
+한 줄씩 보면 다음 뜻이다.
+
+- `cmake_minimum_required(VERSION 3.16)`
+    - 이 프로젝트를 빌드하려면 최소 CMake 3.16 이상이 필요하다는 뜻이다.
+- `project(toy_llvm LANGUAGES CXX)`
+    - 프로젝트 이름을 `toy_llvm`로 정하고, C++만 사용하겠다고 선언한다.
+- `set(CMAKE_CXX_STANDARD 17)`
+    - C++17 표준으로 컴파일하도록 설정한다.
+- `set(CMAKE_CXX_STANDARD_REQUIRED ON)`
+    - C++17이 아니면 다른 버전으로 대충 넘어가지 말고 오류를 내도록 한다.
+- `find_program(LLVM_CONFIG llvm-config REQUIRED)`
+    - 시스템에서 `llvm-config` 실행 파일을 찾고, 없으면 설정 단계에서 바로 실패한다.
+- `execute_process(...)`
+    - CMake 설정 단계에서 `llvm-config --cxxflags`를 실행해서 LLVM 컴파일 옵션을 가져온다.
+- `OUTPUT_VARIABLE LLVM_CXXFLAGS`
+    - 실행 결과를 `LLVM_CXXFLAGS` 변수에 저장한다.
+- `OUTPUT_STRIP_TRAILING_WHITESPACE`
+    - 출력 끝의 불필요한 공백과 줄바꿈을 제거한다.
+- `separate_arguments(LLVM_CXXFLAGS NATIVE_COMMAND ${LLVM_CXXFLAGS})`
+    - 문자열로 들어온 플래그들을 CMake가 다룰 수 있는 인자 목록으로 쪼갠다.
+- 두 번째 `execute_process(...)`
+    - `llvm-config --ldflags --system-libs --libs all`을 실행해서 링크에 필요한 옵션들을 가져온다.
+- `OUTPUT_VARIABLE LLVM_LDFLAGS`
+    - 그 결과를 `LLVM_LDFLAGS`에 저장한다.
+- `separate_arguments(LLVM_LDFLAGS NATIVE_COMMAND ${LLVM_LDFLAGS})`
+    - 링크 옵션 문자열도 인자 목록으로 분리한다.
+- `add_executable(toy my_llvm.cpp)`
+    - `my_llvm.cpp`를 컴파일해서 `toy` 실행 파일을 만든다.
+- `target_compile_options(toy PRIVATE ${LLVM_CXXFLAGS})`
+    - `toy`를 컴파일할 때만 LLVM 컴파일 옵션을 붙인다.
+- `target_link_libraries(toy PRIVATE ${LLVM_LDFLAGS})`
+    - `toy`를 링크할 때만 LLVM 라이브러리와 시스템 라이브러리를 붙인다.
+- `set(GENERATED_OBJECT ${CMAKE_BINARY_DIR}/output.o)`
+    - 생성될 결과 파일 `output.o`의 경로를 빌드 디렉토리 기준으로 저장한다.
+- `set(KALEIDOSCOPE_INPUT ${CMAKE_CURRENT_SOURCE_DIR}/kaleidoscope_input.txt)`
+    - 입력용 Kaleidoscope 소스 파일의 경로를 현재 소스 디렉토리 기준으로 저장한다.
+- `add_custom_command(...)`
+    - `output.o`를 만드는 사용자 정의 빌드 명령을 등록한다.
+- `OUTPUT ${GENERATED_OBJECT}`
+    - 이 명령이 최종적으로 만들어내는 산출물을 `output.o`로 지정한다.
+- `COMMAND /bin/bash -c "$<TARGET_FILE:toy> < ${KALEIDOSCOPE_INPUT}"`
+    - `toy` 실행 파일을 실행하고, `kaleidoscope_input.txt`를 표준 입력으로 넘긴다.
+- `DEPENDS toy ${KALEIDOSCOPE_INPUT}`
+    - `toy`나 입력 파일이 바뀌면 `output.o`를 다시 만들도록 한다.
+- `WORKING_DIRECTORY ${CMAKE_BINARY_DIR}`
+    - 커스텀 명령을 빌드 디렉토리에서 실행한다.
+- `COMMENT "Generating output.o from Kaleidoscope source"`
+    - 빌드 중에 어떤 작업을 하는지 메시지를 보여준다.
+- `VERBATIM`
+    - 명령 인자를 CMake가 안전하게 그대로 전달하도록 한다.
+- `add_custom_target(generate_output DEPENDS ${GENERATED_OBJECT})`
+    - `output.o` 생성을 전담하는 빌드 타겟을 만든다.
+- `add_executable(main main.cpp ${GENERATED_OBJECT})`
+    - `main.cpp`와 생성된 `output.o`를 합쳐서 최종 실행 파일 `main`을 만든다.
+- `add_dependencies(main generate_output)`
+    - `main`을 만들기 전에 먼저 `generate_output`이 실행되도록 순서를 보장한다.
+
+이 흐름을 한 문장으로 정리하면, `my_llvm.cpp`로 Kaleidoscope 코드를 `output.o`로 먼저 만들고, 그 `output.o`를 `main.cpp`와 함께 링크해서 최종 프로그램을 만드는 구조다.

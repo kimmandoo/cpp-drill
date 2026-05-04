@@ -345,7 +345,43 @@ ThreadSanitizer로 data race 발견할 수 있다.
 
 `g++ -std=c++17 -g -O1 -fsanitize=thread -fno-omit-frame-pointer -pthread main.cpp -o app`
 
-## cpp 기본 도구들
+### join, detach
+
+join은 kotlin에서도 있던거라 이해가 빠르다. 그 스레드 작업이 끝나는 걸 기다리는 것.
+
+그리고 detach는 분리하는 것.
+
+```cpp
+t.join();
+std::thread t(hello);
+t.detach();
+```
+
+detached thread는 main 함수가 끝난 뒤에도 따로 돌 수 있고, 이미 사라진 객체를 참조할 수 있기 때문에 함부로 사용하면 안된다..
+
+```cpp
+#include <iostream>
+#include <thread>
+
+void run(int& value) {
+    std::cout << value << std::endl;
+}
+
+int main() {
+    int x = 10;
+
+    std::thread t(run, std::ref(x));
+    t.detach();
+
+    return 0;
+}
+```
+
+이 코드에서 잘못된 점은 main이 끝난 뒤 x가 사라지는데, main과 별개로 실행되는 detached thread t가 x에 접근할 가능성이 있다는 것이다.
+
+# cpp 기본 도구들
+
+참고로 락걸 때, 그냥 {} 로 빈 스코프 열어서 임계구역 만드는 게 관행같음
 
 - std::thread
 - std::mutex
@@ -354,8 +390,6 @@ ThreadSanitizer로 data race 발견할 수 있다.
 - std::condition_variable
 - std::atomic
 - std::future / std::async
-
-참고로 락걸 때, 그냥 {} 로 빈 스코프 열어서 임계구역 만드는 게 관행같음
 
 ## 스레드 수를 막 늘려도 되나?
 
@@ -369,3 +403,34 @@ ThreadSanitizer로 data race 발견할 수 있다.
 
 이거 다 감당해야됨. 코어 개수에 비해 너무 많은 스레드는 교체비용만 발생하고 아무것도 못할 수 도 있다.
 
+소비자가 큐에서 데이터를 빼갔다면, 생산자는 반대로 데이터를 넣고 "자, 이제 먹어!"라고 신호를 보내야됨
+
+```cpp
+void produce(int item) {
+    {
+        std::lock_guard<std::mutex> lock(mtx); // 1. 우선 열쇠를 얻고
+        q.push(item);                          // 2. 큐에 데이터를 넣은 뒤
+        std::cout << "produce: " << item << "\n";
+    } // 3. lock_guard가 종료되면서 열쇠를 반납 (Scope 종료)
+
+    cv.notify_one(); // 4. 자고 있는 소비자 중 한 명을 깨움!
+}
+```
+
+```text
+소비자: "큐가 비었네? 일단 잠들자 (cv.wait)"
+생산자: 데이터를 만들어서 큐에 넣고, 벨을 눌러 (cv.notify_one)
+소비자: 벨 소리에 깨어나서 큐를 확인. "오, 데이터가 있네!"
+소비자: 데이터를 맛있게 먹고(처리), 다시 큐가 비면 잠듦
+종료: 생산자가 더 줄 게 없으면 is_finished = true로 만들고 마지막 벨을 눌러. 소비자는 "이제 끝났구나" 하고 퇴근(break)
+```
+
+condition_variable를 안쓰면 busy waiting이 발생함.
+
+만약 생산자가 notify_one()을 보냈는데, 그 시점에 기다리고 있는 소비자가 한 명도 없다면? 그 신호는 그냥 증발해버린다. 그래서 
+
+```cpp
+cv.wait(lock, []{ return !q.empty() || is_finished; });
+```
+
+이거로 큐에 데이터가 있는지까지 검사해서 조건을 쓰는 것! notify one은 os가 알아서 하나 깨움

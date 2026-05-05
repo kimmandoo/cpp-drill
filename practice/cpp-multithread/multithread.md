@@ -434,3 +434,10 @@ cv.wait(lock, []{ return !q.empty() || is_finished; });
 ```
 
 이거로 큐에 데이터가 있는지까지 검사해서 조건을 쓰는 것! notify one은 os가 알아서 하나 깨움
+
+threadsanitizer로 data race 잡을 수 있음
+
+```cpp
+g++ -std=c++17 -g -O1 -fsanitize=thread -fno-omit-frame-pointer -pthread main.cpp -o app
+```
+

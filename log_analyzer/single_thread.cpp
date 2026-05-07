@@ -74,13 +74,13 @@ std::string getCurrentTimeStr() {
 //     // 스트림에서 단어를 하나씩 꺼내서 오른쪽에 있는 변수에 저장
 //     std::string date;
 //     std::string time;
-//     std::string uid;
-//     std::string gid;
+//     std::string pid;
+//     std::string tid;
 //     char levelChar;
 //     std::string tagWithColon;
 //     std::string eventName;
 
-//     // if (!(iss >> date >> time >> uid >> gid >> levelChar >> tagWithColon >> eventName)) {
+//     // if (!(iss >> date >> time >> pid >> tid >> levelChar >> tagWithColon >> eventName)) {
 //     //     return false;
 //     // }
 
@@ -103,7 +103,7 @@ std::string getCurrentTimeStr() {
 //     // outRecord.eventName = eventName;
 //     // outRecord.message = message;
 
-//     if (!(iss >> date >> time >> uid >> gid >> levelChar)) {
+//     if (!(iss >> date >> time >> pid >> tid >> levelChar)) {
 //         return false;
 //     }
 
@@ -149,7 +149,7 @@ bool parseLogLine(const std::string& line, LogRecord& outRecord) {
     if (endPos == std::string::npos) return false;
     std::string time = line.substr(pos, endPos - pos);
 
-    // UID, GID - skip
+    // pid, tid - skip
     for (int i = 0; i < 2; ++i) {
         pos = line.find_first_not_of(' ', endPos);
         if (pos == std::string::npos) return false;

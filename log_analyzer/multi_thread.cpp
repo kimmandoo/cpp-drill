@@ -8,6 +8,9 @@
 #include <iomanip>
 #include <chrono>
 #include <ctime>
+#include <thread>
+#include <future>
+#include <stdexcept>
 
 struct LogRecord {
     std::string timestamp;
@@ -23,7 +26,7 @@ struct ErrorEvent {
 };
 
 struct AnalysisResult {
-    size_t totalLines = 0; // unsigned_long으로 메모리 할당 가능한 가장 큰 객체 크기 담기 가능
+    size_t totalLines = 0;
     size_t parsedLines = 0;
     size_t ignoredLines = 0;
 
@@ -63,73 +66,9 @@ std::string getCurrentTimeStr() {
     struct tm* parts = std::localtime(&now_c);
 
     char buffer[64];
-    // YYYY-MM-DD_HH-MM-SS
     std::strftime(buffer, sizeof(buffer), "%Y-%m-%d_%H-%M-%S", parts);
     return std::string(buffer);
 }
-
-// bool parseLogLine(const std::string& line, LogRecord& outRecord) {
-//     std::istringstream iss(line);
-//     // 빈칸 기준으로 split과 동일.
-//     // 스트림에서 단어를 하나씩 꺼내서 오른쪽에 있는 변수에 저장
-//     std::string date;
-//     std::string time;
-//     std::string uid;
-//     std::string gid;
-//     char levelChar;
-//     std::string tagWithColon;
-//     std::string eventName;
-
-//     // if (!(iss >> date >> time >> uid >> gid >> levelChar >> tagWithColon >> eventName)) {
-//     //     return false;
-//     // }
-
-//     // if (tagWithColon.empty() || tagWithColon.back() != ':') {
-//     //     return false;
-//     // }
-
-//     // std::string tag = tagWithColon.substr(0, tagWithColon.size() - 1);
-
-//     // std::string message;
-//     // std::getline(iss, message);
-
-//     // if (!message.empty() && message.front() == ' ') {
-//     //     message.erase(message.begin());
-//     // }
-
-//     // outRecord.timestamp = date + " " + time;
-//     // outRecord.level = convertLevel(levelChar);
-//     // outRecord.tag = tag;
-//     // outRecord.eventName = eventName;
-//     // outRecord.message = message;
-
-//     if (!(iss >> date >> time >> uid >> gid >> levelChar)) {
-//         return false;
-//     }
-
-//     std::string remainder;
-//     std::getline(iss, remainder); // 앞에꺼 끊고 나머지 가져와서 처리하기
-
-//     size_t colonPos = remainder.find(": ");
-//     if(colonPos == std::string::npos) return false; // 못찾으면 skip
-
-//     std::string tag = trim(remainder.substr(0, colonPos));
-//     std::string rawMessage = remainder.substr(colonPos + 2);
-//     std::string message = "";
-//     std::istringstream msgIss(rawMessage);
-    
-//     std::getline(msgIss, message);
-//     if (!message.empty() && message.front() == ' ') {
-//         message.erase(0, 1);
-//     }
-
-//     outRecord.timestamp = date + " " + time;
-//     outRecord.level = convertLevel(levelChar);
-//     outRecord.tag = tag;
-//     outRecord.message = message;
-
-//     return true;
-// }
 
 bool parseLogLine(const std::string& line, LogRecord& outRecord) {
     if (line.empty()) return false;
@@ -137,7 +76,6 @@ bool parseLogLine(const std::string& line, LogRecord& outRecord) {
     size_t pos = 0;
     size_t endPos = 0;
 
-    // date
     endPos = line.find(' ', pos);
     if (endPos == std::string::npos) return false;
     std::string date = line.substr(pos, endPos - pos);
@@ -149,7 +87,6 @@ bool parseLogLine(const std::string& line, LogRecord& outRecord) {
     if (endPos == std::string::npos) return false;
     std::string time = line.substr(pos, endPos - pos);
 
-    // UID, GID - skip
     for (int i = 0; i < 2; ++i) {
         pos = line.find_first_not_of(' ', endPos);
         if (pos == std::string::npos) return false;
@@ -157,12 +94,10 @@ bool parseLogLine(const std::string& line, LogRecord& outRecord) {
         if (endPos == std::string::npos) return false;
     }
 
-    // Level
     pos = line.find_first_not_of(' ', endPos);
     if (pos == std::string::npos) return false;
     char levelChar = line[pos];
     
-    // 레벨 뒤의 공백 스킵
     pos = line.find_first_not_of(' ', pos + 1);
     if (pos == std::string::npos) return false;
 
@@ -202,24 +137,32 @@ void analyzeRecord(const LogRecord& record, std::streampos offset, AnalysisResul
         // errorEvent.message = record.message;
 
         result.errorEventCount[record.tag]++;
-        // result.errorEvents.push_back(errorEvent);
         result.errorOffsets.push_back(offset); 
     }
 }
 
-AnalysisResult analyzeFile(const std::string& filePath) {
-    std::ifstream file(filePath);
+AnalysisResult analyzeChunk(const std::string& filePath, std::streampos startOffset, std::streampos endOffset) {
+    AnalysisResult result;
 
-    if (!file.is_open()) {
-        throw std::runtime_error("Failed to open file: " + filePath);
+    std::ifstream file(filePath, std::ios::binary); 
+    if (!file.is_open()) return result;
+    // 스레드 별로 chunck 먹일 예정
+    file.seekg(startOffset);
+
+    if (startOffset > 0) {
+        std::string temp;
+        std::getline(file, temp); // 시작 위치에서 한 줄 읽어서 버리기
     }
 
-    AnalysisResult result;
     std::string line;
-    std::streampos currentOffset = 0; // 현재 읽을 줄의 바이트 시작 위치
+    while (true) {
+        std::streampos currentOffset = file.tellg();
+        
+        // EOF나 읽을 위치가 끝을 넘어섰으면 종료
+        if (currentOffset == std::streampos(-1) || currentOffset >= endOffset) {
+            break;
+        }
 
-    while (std::getline(file, line)) {
-        currentOffset = file.tellg(); // 줄을 읽기 전에 현재 위치를 저장
         if (!std::getline(file, line)) {
             break;
         }
@@ -237,49 +180,63 @@ AnalysisResult analyzeFile(const std::string& filePath) {
     return result;
 }
 
-std::vector<std::pair<std::string, size_t>> sortByCountDesc(
-    const std::unordered_map<std::string, size_t>& map
-) {
-    std::vector<std::pair<std::string, size_t>> items(map.begin(), map.end());
+AnalysisResult mergeResults(const std::vector<AnalysisResult>& results) {
+    AnalysisResult global;
+    
+    for (const auto& r : results) {
+        global.totalLines += r.totalLines;
+        global.parsedLines += r.parsedLines;
+        global.ignoredLines += r.ignoredLines;
 
-    std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second; // 내림차순 이벤트 정렬
-    });
+        for (const auto& [k, v] : r.levelCount) global.levelCount[k] += v;
+        for (const auto& [k, v] : r.eventCount) global.eventCount[k] += v;
+        for (const auto& [k, v] : r.errorEventCount) global.errorEventCount[k] += v;
 
-    return items;
+        global.errorOffsets.insert(global.errorOffsets.end(), r.errorOffsets.begin(), r.errorOffsets.end());
+    }
+
+    // 스레드별로 작업하여 오프셋 순서가 뒤섞였으므로, 오름차순으로 정렬
+    // 순서 정렬이 필요한 이유는 원본 파일에서 에러 이벤트를 읽어올 때 파일을 순차적으로 읽는 것이 디스크 I/O 효율에 더 좋기 때문
+    std::sort(global.errorOffsets.begin(), global.errorOffsets.end());
+
+    return global;
 }
 
-void printResult(const AnalysisResult& result) {
-    std::cout << "===== Android Log Analysis Result =====\n\n";
+AnalysisResult analyzeFileMultiThreaded(const std::string& filePath) {
+    std::ifstream file(filePath, std::ios::ate | std::ios::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open file: " + filePath);
+    }
+    std::streampos fileSize = file.tellg();
+    file.close();
 
-    std::cout << "Total lines : " << result.totalLines << "\n";
-    std::cout << "Parsed lines: " << result.parsedLines << "\n";
-    std::cout << "Ignored lines: " << result.ignoredLines << "\n\n";
+    size_t numThreads = std::thread::hardware_concurrency();
+    if (numThreads == 0) numThreads = 4;
+    
+    std::streampos chunkSize = fileSize / numThreads;
+    std::vector<std::future<AnalysisResult>> futures;
 
-    std::cout << "Level Count:\n";
-    auto sortedLevels = sortByCountDesc(result.levelCount);
-    for (const auto& [level, count] : sortedLevels) {
-        std::cout << level << " : " << count << "\n";
+    for (size_t i = 0; i < numThreads; ++i) {
+        std::streampos start = i * chunkSize;
+        std::streampos end = (i == numThreads - 1) ? fileSize : start + chunkSize;
+        
+        futures.push_back(std::async(std::launch::async, analyzeChunk, filePath, start, end));
     }
 
-    std::cout << "\nEvent Count:\n";
-    auto sortedEvents = sortByCountDesc(result.eventCount);
-    for (const auto& [eventName, count] : sortedEvents) {
-        std::cout << eventName << " : " << count << "\n";
+    std::vector<AnalysisResult> chunkResults;
+    for (auto& f : futures) {
+        chunkResults.push_back(f.get());
     }
 
-    std::cout << "\nError Events:\n";
-    if (result.errorEvents.empty()) {
-        std::cout << "No error events found.\n";
-        return;
-    }
+    return mergeResults(chunkResults);
+}
 
-    for (const auto& error : result.errorEvents) {
-        std::cout
-            << "[" << error.timestamp << "] "
-            << error.level << " "
-            << error.message << "\n";
-    }
+std::vector<std::pair<std::string, size_t>> sortByCountDesc(const std::unordered_map<std::string, size_t>& map) {
+    std::vector<std::pair<std::string, size_t>> items(map.begin(), map.end());
+    std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
+    return items;
 }
 
 void saveResultToFile(const std::string& filename, const AnalysisResult& result, const std::string& originalFilePath) {
@@ -291,7 +248,6 @@ void saveResultToFile(const std::string& filename, const AnalysisResult& result,
     }
 
     outFile << "===== Android Log Analysis Result =====\n\n";
-
     outFile << "Total lines : " << result.totalLines << "\n";
     outFile << "Parsed lines: " << result.parsedLines << "\n";
     outFile << "Ignored lines: " << result.ignoredLines << "\n\n";
@@ -306,49 +262,26 @@ void saveResultToFile(const std::string& filename, const AnalysisResult& result,
     auto sortedErrorEvents = sortByCountDesc(result.errorEventCount);
     size_t errCount = 0;
     for (const auto& [tag, errors] : sortedErrorEvents) {
-        size_t total = result.eventCount.at(tag); // tag가 참조형으로 넘어오기 때문에 at을 써줘야
+        size_t total = result.eventCount.at(tag);
         double errorRate = (double)errors / total * 100.0;
-
         outFile << tag << " : " << errors << " / " << total << " (" << std::fixed << std::setprecision(2) << errorRate << "%)\n";
         if (++errCount >= 20) break;
     }
 
-    // outFile << "\nEvent Count:\n";
-    
-    // auto sortedEvents = sortByCountDesc(result.eventCount);
-    // for (const auto& [eventName, count] : sortedEvents) {
-    //     outFile << eventName << " : " << count << "\n";
-    // }
-
     outFile << "\nError Events:\n";
-    // if (result.errorEvents.empty()) {
-    //     outFile << "No error events found.\n";
-    // } else {
-    //     for (const auto& error : result.errorEvents) {
-    //         outFile << "[" << error.timestamp << "] "
-    //                 << error.level << " "
-    //                 << error.message << "\n";
-    //     }
-    // }
     if (result.errorOffsets.empty()) {
         outFile << "No error events found.\n";
     } else {
         std::ifstream originalFile(originalFilePath);
         if (originalFile.is_open()) {
             std::string errorLine;
-
             for (std::streampos offset : result.errorOffsets) {
-                originalFile.seekg(offset); // 해당 바이트 위치로 포인터 이동
-                std::getline(originalFile, errorLine); // 그 한 줄만 읽기
+                originalFile.seekg(offset);
+                std::getline(originalFile, errorLine);
                 outFile << errorLine << "\n";
             }
-        } else {
-            outFile << "Failed to open original file to fetch error events.\n";
         }
     }
-
-
-
     outFile.close();
     std::cout << filename << " saved.\n";
 }
@@ -363,14 +296,14 @@ int main(int argc, char* argv[]) {
         std::string filePath = argv[1];
 
         // auto start = std::chrono::high_resolution_clock::now();
-        AnalysisResult result = analyzeFile(filePath);
+
+        AnalysisResult result = analyzeFileMultiThreaded(filePath);
 
         // auto end = std::chrono::high_resolution_clock::now();
         // std::chrono::duration<double, std::milli> diff = end - start;
         // std::cout << "Analysis Time: " << diff.count() << " ms\n";
 
-        // printResult(result);
-        std::string fileName = "./out/analysis_" + getCurrentTimeStr() + ".txt";
+        std::string fileName = "./out/multi_analysis_" + getCurrentTimeStr() + ".txt";
         saveResultToFile(fileName, result, filePath);
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";

@@ -152,3 +152,110 @@ page-fault 86%감소 복사, 저장이 안일어나니까 heap 할당도 확 줄
 instruction도 반토막
 user타임은 줄고, sys타임은 늘었음, 근데 전체 시간은 줄었음.
 -> 문자열 연산 안하니까 앱 내 연산 시간은 확 줄고, 시스템 함수로 offset 처리해야되서 sys시간이 늘어났다. 시스템 콜은 늘었지만 문자열 복사가 없어져서 전체 실행시간이 줄었음.
+
+# multi-thread 적용
+
+지금은 겨우 수백만 줄인데, 수천만 줄을 대상으로 하면 더 오랜시간이 걸릴 것으로 판단.
+
+cpu 코어 개수만큼 나눠서 처리를 나눠놨더니 시간이 확 줄었다. 병렬 계산의 장점
+
+single
+```bash
+ Performance counter stats for './single_analyzer target.log':
+
+        1640145300      task-clock:u                     #    0.909 CPUs utilized             
+                 0      context-switches:u               #    0.000 /sec                      
+                 0      cpu-migrations:u                 #    0.000 /sec                      
+               971      page-faults:u                    #  592.021 /sec                      
+       11672982755      instructions:u                   #    2.80  insn per cycle            
+                                                  #    0.02  stalled cycles per insn   
+        4171844792      cycles:u                         #    2.544 GHz                       
+         204008129      stalled-cycles-frontend:u        #    4.89% frontend cycles idle      
+          52795928      stalled-cycles-backend:u         #    1.27% backend cycles idle       
+        2633212301      branches:u                       #    1.605 G/sec                     
+          30357161      branch-misses:u                  #    1.15% of all branches           
+
+       1.804770269 seconds time elapsed
+
+       1.072711000 seconds user
+       0.563628000 seconds sys
+```
+
+multi
+```bash
+ Performance counter stats for './multi_analyzer target.log':
+
+        4947830100      task-clock:u                     #    8.094 CPUs utilized             
+                 0      context-switches:u               #    0.000 /sec                      
+                 0      cpu-migrations:u                 #    0.000 /sec                      
+              3228      page-faults:u                    #  652.407 /sec                      
+       21721996561      instructions:u                   #    1.93  insn per cycle            
+                                                  #    0.03  stalled cycles per insn   
+       11259169441      cycles:u                         #    2.276 GHz                       
+         584661449      stalled-cycles-frontend:u        #    5.19% frontend cycles idle      
+         141380731      stalled-cycles-backend:u         #    1.26% backend cycles idle       
+        4909704443      branches:u                       #  992.294 M/sec                     
+          56120091      branch-misses:u                  #    1.14% of all branches           
+
+       0.611267262 seconds time elapsed
+
+       2.886787000 seconds user
+       1.966233000 seconds sys
+```
+
+테스트 환경이 8코어라, cpu사용이 8배 늘어났음. 작업 코어가 늘어나면서 user, sys 처리시간도 같이 늘어났으나 전체 시간은 확 줄음
+
+## trouble shooting
+
+### 작업 분할
+
+```cpp
+size_t numThreads = std::thread::hardware_concurrency();
+if (numThreads == 0) numThreads = 4;
+
+std::streampos chunkSize = fileSize / numThreads;
+std::vector<std::future<AnalysisResult>> futures;
+
+for (size_t i = 0; i < numThreads; ++i) {
+   std::streampos start = i * chunkSize;
+   std::streampos end = (i == numThreads - 1) ? fileSize : start + chunkSize;
+   
+   futures.push_back(std::async(std::launch::async, analyzeChunk, filePath, start, end));
+}
+```
+코어 개수만큼 덩어리를 나누고, 처음부터 그 덩어리 크기대로 offset잡아서 돌리기
+
+이거 제외하면 나머지는 거의 동일.
+
+병렬 작업을 시키기 위해서 future header를 사용한다.
+
+`std::async`, `std::launch::async`, `std::future` 이거 세개 쓸 때 필요함.
+
+지금 병렬작업은 thread를 직접 생성해서 하는 게 아니라 std::async로 작업함. std::launch::async를 값으로 줬기 때문에 각 analyzeChunk 작업을 별도의 비동기작업으로 실행한다.
+
+그리고 이 작업을 std::future를 타입으로 갖는 vector에 push_back 하는데, future는 나중에 결과가 도착할 것임을 기대하는 역할이다.
+
+analyzeChunk가 AnalysisResult를 반환하는데, 이걸 비동기로 받을 수있게 future로 감싸서 vector로 만든 것.
+
+`chunkResults.push_back(f.get());`여기서 f.get()은 future의 멤버 함수를 쓰는 것으로, 각 작업이 끝날때까지 기다렸다가 값을 반환한다.
+
+그리고 스레드작업이 있기 때문에, 빌드할 때 `-pthread` 옵션을 추가해준다.
+
+wsl에서 테스트할 때는 일단 빼도 문제가 없었다.
+
+pthread 관련 심볼이 통합돼서 링크에러가 해결된 것으로 추정되는데, 일단 스레드 옵션을 켜서 빌드하면 컴파일러한테 스레드 관련 설정을 적용하라는 의미가 명시적이므로 붙여서 실행하는 걸 권장한다고 함.
+
+
+
+### 오프셋 정렬
+
+```cpp
+std::sort(global.errorOffsets.begin(), global.errorOffsets.end());
+```
+
+파일에서 읽어오기 전에, offset을 정렬해주는 작업이 필요함.
+
+ifstream이 내부버퍼에 저장해둔 내용을 재사용할 수 있는 확률이 높아지기 때문인데, 만약 offset이 널뛰면 내부 버퍼도 거기에 맞춰 계속 invalidate 될 것.
+
+offset 기준으로 정렬하면 원본 파일 접근 시 seek 이동이 줄어들어서 순차읽기에 가까워져서 스트림 캐싱 효율이 좋아짐...
+
